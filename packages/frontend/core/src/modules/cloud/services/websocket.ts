@@ -1,37 +1,66 @@
 import { OnEvent, Service } from '@toeverything/infra';
-import type { Socket } from 'socket.io-client';
 import { Manager } from 'socket.io-client';
 
-import { getAffineCloudBaseUrl } from '../services/fetch';
-import { AccountChanged } from './auth';
+import { ApplicationStarted } from '../../lifecycle';
+import { AccountChanged } from '../events/account-changed';
+import type { WebSocketAuthProvider } from '../provider/websocket-auth';
+import type { AuthService } from './auth';
+import type { ServerService } from './server';
 
-@OnEvent(AccountChanged, e => e.reconnect)
+@OnEvent(AccountChanged, e => e.update)
+@OnEvent(ApplicationStarted, e => e.update)
 export class WebSocketService extends Service {
-  ioManager: Manager = new Manager(`${getAffineCloudBaseUrl()}/`, {
+  ioManager: Manager = new Manager(`${this.serverService.server.baseUrl}/`, {
     autoConnect: false,
     transports: ['websocket'],
     secure: location.protocol === 'https:',
   });
-  sockets: Set<Socket> = new Set();
+  socket = this.ioManager.socket('/', {
+    auth: this.webSocketAuthProvider
+      ? cb => {
+          this.webSocketAuthProvider
+            ?.getAuthToken(`${this.serverService.server.baseUrl}/`)
+            .then(v => {
+              cb(v ?? {});
+            })
+            .catch(e => {
+              console.error('Failed to get auth token for websocket', e);
+            });
+        }
+      : undefined,
+  });
+  refCount = 0;
 
-  constructor() {
+  constructor(
+    private readonly serverService: ServerService,
+    private readonly authService: AuthService,
+    private readonly webSocketAuthProvider?: WebSocketAuthProvider
+  ) {
     super();
   }
 
-  newSocket(): Socket {
-    const socket = this.ioManager.socket('/');
-    this.sockets.add(socket);
-
-    return socket;
+  /**
+   * Connect socket, with automatic connect and reconnect logic.
+   * External code should not call `socket.connect()` or `socket.disconnect()` manually.
+   * When socket is no longer needed, call `dispose()` to clean up resources.
+   */
+  connect() {
+    this.refCount++;
+    this.update();
+    return {
+      socket: this.socket,
+      dispose: () => {
+        this.refCount--;
+        this.update();
+      },
+    };
   }
 
-  reconnect(): void {
-    for (const socket of this.sockets) {
-      socket.disconnect();
-    }
-
-    for (const socket of this.sockets) {
-      socket.connect();
+  update(): void {
+    if (this.authService.session.account$.value && this.refCount > 0) {
+      this.socket.connect();
+    } else {
+      this.socket.disconnect();
     }
   }
 }

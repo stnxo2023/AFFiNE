@@ -1,3 +1,4 @@
+import type { WebSocketService } from '@affine/core/modules/cloud';
 import { DebugLogger } from '@affine/debug';
 import type { AwarenessConnection } from '@toeverything/infra';
 import type { Socket } from 'socket.io-client';
@@ -17,10 +18,17 @@ type AwarenessChanges = Record<'added' | 'updated' | 'removed', number[]>;
 export class CloudAwarenessConnection implements AwarenessConnection {
   awareness: Awareness | null = null;
 
+  socket: Socket;
+  disposeSocket: () => void;
+
   constructor(
     private readonly workspaceId: string,
-    private readonly socket: Socket
-  ) {}
+    webSocketService: WebSocketService
+  ) {
+    const { socket, dispose } = webSocketService.connect();
+    this.socket = socket;
+    this.disposeSocket = dispose;
+  }
 
   connect(awareness: Awareness): void {
     this.socket.on('space:broadcast-awareness-update', this.awarenessBroadcast);
@@ -38,8 +46,6 @@ export class CloudAwarenessConnection implements AwarenessConnection {
 
     if (this.socket.connected) {
       this.handleConnect();
-    } else {
-      this.socket.connect();
     }
   }
 
@@ -160,7 +166,7 @@ export class CloudAwarenessConnection implements AwarenessConnection {
         spaceType: 'workspace',
         spaceId: this.workspaceId,
         docId: this.workspaceId,
-        clientVersion: runtimeConfig.appVersion,
+        clientVersion: BUILD_CONFIG.appVersion,
       },
       (res: any) => {
         logger.debug('awareness handshake finished', res);
@@ -181,7 +187,10 @@ export class CloudAwarenessConnection implements AwarenessConnection {
 
   handleReject = () => {
     this.socket.off('server-version-rejected', this.handleReject);
-    this.disconnect();
-    this.socket.disconnect();
   };
+
+  dispose() {
+    this.disconnect();
+    this.disposeSocket();
+  }
 }
