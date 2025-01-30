@@ -6,13 +6,13 @@ import {
   Cache,
   DocHistoryNotFound,
   DocNotFound,
-  EventEmitter,
+  EventBus,
   FailedToSaveUpdates,
   FailedToUpsertSnapshot,
   metrics,
   Mutex,
-} from '../../../fundamentals';
-import { retryable } from '../../../fundamentals/utils/promise';
+} from '../../../base';
+import { retryable } from '../../../base/utils/promise';
 import { DocStorageOptions } from '../options';
 import {
   DocRecord,
@@ -22,7 +22,18 @@ import {
 } from '../storage';
 
 const UPDATES_QUEUE_CACHE_KEY = 'doc:manager:updates';
-
+declare global {
+  interface Events {
+    'doc.snapshot.deleted': {
+      workspaceId: string;
+      docId: string;
+    };
+    'doc.snapshot.updated': {
+      workspaceId: string;
+      docId: string;
+    };
+  }
+}
 @Injectable()
 export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
   private readonly logger = new Logger(PgWorkspaceDocStorageAdapter.name);
@@ -31,7 +42,7 @@ export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
     private readonly db: PrismaClient,
     private readonly mutex: Mutex,
     private readonly cache: Cache,
-    private readonly event: EventEmitter,
+    private readonly event: EventBus,
     protected override readonly options: DocStorageOptions
   ) {
     super(options);
@@ -132,11 +143,6 @@ export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
   async deleteSpace(workspaceId: string) {
     const ident = { where: { workspaceId } };
     await this.db.$transaction([
-      this.db.workspace.deleteMany({
-        where: {
-          id: workspaceId,
-        },
-      }),
       this.db.snapshot.deleteMany(ident),
       this.db.update.deleteMany(ident),
       this.db.snapshotHistory.deleteMany(ident),
@@ -344,6 +350,17 @@ export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
         return false;
       }
 
+      const historyMaxAge = await this.options
+        .historyMaxAge(snapshot.spaceId)
+        .catch(
+          () =>
+            0 /* edgecase: user deleted but owned workspaces not handled correctly */
+        );
+
+      if (historyMaxAge === 0) {
+        return false;
+      }
+
       await this.db.snapshotHistory
         .create({
           select: {
@@ -355,9 +372,7 @@ export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
             timestamp: new Date(snapshot.timestamp),
             blob: Buffer.from(snapshot.bin),
             createdBy: snapshot.editor,
-            expiredAt: new Date(
-              Date.now() + (await this.options.historyMaxAge(snapshot.spaceId))
-            ),
+            expiredAt: new Date(Date.now() + historyMaxAge),
           },
         })
         .catch(() => {
@@ -466,9 +481,9 @@ export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
       const updatedSnapshot = result.at(0);
 
       if (updatedSnapshot) {
-        this.event.emit('snapshot.updated', {
+        this.event.emit('doc.snapshot.updated', {
           workspaceId: snapshot.spaceId,
-          id: snapshot.docId,
+          docId: snapshot.docId,
         });
       }
 
@@ -484,7 +499,7 @@ export class PgWorkspaceDocStorageAdapter extends DocStorageAdapter {
     workspaceId: string,
     docId: string
   ) {
-    const lock = await this.mutex.lock(`doc:update:${workspaceId}:${docId}`);
+    const lock = await this.mutex.acquire(`doc:update:${workspaceId}:${docId}`);
 
     if (!lock) {
       throw new Error('Too many concurrent writings');
